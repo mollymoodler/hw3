@@ -17,12 +17,15 @@
 int main(int argc, char** argv) {
     upcxx::init();
 
+    // std::cout << "Hello world from process " << upcxx::rank_me()
+    // << " out of " << upcxx::rank_n() << " processes" << std::endl;
+
     // TODO: Dear Students,
     // Please remove this if statement, when you start writing your parallel implementation.
-    if (upcxx::rank_n() > 1) {
-        throw std::runtime_error("Error: parallel implementation not started yet!"
-                                 " (remove this when you start working.)");
-    }
+    // if (upcxx::rank_n() > 1) {
+    //     throw std::runtime_error("Error: parallel implementation not started yet!"
+    //                              " (remove this when you start working.)");
+    // }
 
     if (argc < 2) {
         BUtil::print("usage: srun -N nodes -n ranks ./kmer_hash kmer_file [verbose|test [prefix]]\n");
@@ -68,6 +71,8 @@ int main(int argc, char** argv) {
         BUtil::print("Finished reading kmers.\n");
     }
 
+    upcxx::barrier();
+
     auto start = std::chrono::high_resolution_clock::now();
 
     std::vector<kmer_pair> start_nodes;
@@ -82,6 +87,9 @@ int main(int argc, char** argv) {
             start_nodes.push_back(kmer);
         }
     }
+
+    std::cout << hashmap.count << " on processor " << upcxx::rank_me() << std::endl;
+
     auto end_insert = std::chrono::high_resolution_clock::now();
     upcxx::barrier();
 
