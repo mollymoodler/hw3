@@ -48,7 +48,7 @@ HashMap::HashMap(size_t size) {
     kmer_pair* dptr = local_data.local();
     int* uptr = local_used.local();
     for (size_t i = 0; i < my_size; i++) {
-        dptr[i] = kmer_pair();   // Initialize to default (empty bucket)
+        dptr[i] = kmer_pair();   // initialize empty bucket
         uptr[i] = 0;
     }
 
@@ -67,12 +67,21 @@ HashMap::HashMap(size_t size) {
 
 bool HashMap::insert(const kmer_pair &kmer) {
     uint64_t hashv = kmer.hash();
+    BUtil::print("Rank %d: Inserting key %s, hash %llu\n",
+                 upcxx::rank_me(), kmer.kmer.get().c_str(), (unsigned long long)hashv);
+
     for (uint64_t probe = 0; probe < global_size; probe++) {
         uint64_t slot = (hashv + probe) % global_size;
         int owner = owner_of_slot(slot, nranks, local_size);
         uint64_t off = offset_of_slot(slot, local_size);
 
-        bool claimed = upcxx::rpc(owner, [off, used_ptr = all_used_ptrs[owner]]() {
+        if (probe < 2) {
+            BUtil::print("Rank %d: Insert probe %llu: slot %llu, owner %d, offset %llu\n",
+                         upcxx::rank_me(), (unsigned long long)probe,
+                         (unsigned long long)slot, owner, (unsigned long long)off);
+        }
+
+        bool claimed = upcxx::rpc(owner, [off, used_ptr=all_used_ptrs[owner]]() {
             int* used = used_ptr.local();
             if (used[off] == 0) {
                 used[off] = 1;
@@ -82,10 +91,12 @@ bool HashMap::insert(const kmer_pair &kmer) {
         }).wait();
 
         if (claimed) {
-            upcxx::rpc(owner, [off, kmer, data_ptr = all_data_ptrs[owner]]() {
+            upcxx::rpc(owner, [off, kmer, data_ptr=all_data_ptrs[owner]]() {
                 kmer_pair* data = data_ptr.local();
                 data[off] = kmer;
             }).wait();
+            BUtil::print("Rank %d: Insert successful at slot %llu (owner %d, offset %llu)\n",
+                         upcxx::rank_me(), (unsigned long long)slot, owner, (unsigned long long)off);
             return true;
         }
     }
@@ -93,24 +104,33 @@ bool HashMap::insert(const kmer_pair &kmer) {
 }
 
 bool HashMap::find(const pkmer_t &key, kmer_pair &val) {
+    std::string key_str = key.get();
     uint64_t hashv = key.hash();
+    BUtil::print("Rank %d: Looking up key %s, hash %llu\n",
+                 upcxx::rank_me(), key_str.c_str(), (unsigned long long)hashv);
+
     for (uint64_t probe = 0; probe < global_size; probe++) {
         uint64_t slot = (hashv + probe) % global_size;
         int owner = owner_of_slot(slot, nranks, local_size);
         uint64_t off = offset_of_slot(slot, local_size);
 
-        bool used = upcxx::rpc(owner, [off, used_ptr = all_used_ptrs[owner]]() {
+        if (probe < 2) {
+            BUtil::print("Rank %d: Find probe %llu: slot %llu, owner %d, offset %llu\n",
+                         upcxx::rank_me(), (unsigned long long)probe,
+                         (unsigned long long)slot, owner, (unsigned long long)off);
+        }
+
+        bool used = upcxx::rpc(owner, [off, used_ptr=all_used_ptrs[owner]]() {
             return (used_ptr.local()[off] != 0);
         }).wait();
-
-        if (!used)
+        if (!used) {
+            BUtil::print("Rank %d: Slot %llu empty during lookup for key %s\n",
+                         upcxx::rank_me(), (unsigned long long)slot, key_str.c_str());
             return false;
-
-        kmer_pair occupant = upcxx::rpc(owner, [off, data_ptr = all_data_ptrs[owner]]() {
+        }
+        kmer_pair occupant = upcxx::rpc(owner, [off, data_ptr=all_data_ptrs[owner]]() {
             return data_ptr.local()[off];
         }).wait();
-
-        // Compare using the string obtained via get() for each key.
         if (occupant.kmer.get() == key.get()) {
             val = occupant;
             return true;

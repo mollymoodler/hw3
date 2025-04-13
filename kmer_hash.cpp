@@ -5,16 +5,15 @@
 #include <list>
 #include <numeric>
 #include <set>
+#include <upcxx/upcxx.hpp>
 #include <vector>
 #include <fstream>
-#include <upcxx/upcxx.hpp>
-#include <upcxx/dist_object.hpp>
 #include "hash_map.hpp"
 #include "kmer_t.hpp"
 #include "read_kmers.hpp"
 #include "butil.hpp"
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     upcxx::init();
 
     if (argc < 2) {
@@ -24,98 +23,93 @@ int main(int argc, char** argv) {
     }
 
     std::string kmer_fname = argv[1];
-    std::string run_type = (argc >= 3) ? argv[2] : "";
-    std::string test_prefix = (run_type == "test" && argc >= 4) ? argv[3] : "test";
+    std::string run_type = (argc >= 3 ? argv[2] : "");
+    std::string test_prefix = "test";
+    if (run_type == "test" && argc >= 4) {
+        test_prefix = argv[3];
+    }
 
     int ks = kmer_size(kmer_fname);
     if (ks != KMER_LEN) {
-        throw std::runtime_error("Error: " + kmer_fname + " has " + std::to_string(ks) +
-                                 "-mers, but this binary expects " + std::to_string(KMER_LEN) + "-mers.");
+        throw std::runtime_error("Error: " + kmer_fname + " contains " + std::to_string(ks) +
+                                 "-mers, while this binary is compiled for " +
+                                 std::to_string(KMER_LEN) + "-mers. Modify packing.hpp and recompile.");
     }
 
     size_t n_kmers = line_count(kmer_fname);
-    size_t hash_table_size = static_cast<size_t>(n_kmers * (1.0 / 0.5));
+    size_t hash_table_size = n_kmers * 2; // 50% load factor -> table size = 2 * n_kmers
     HashMap hashmap(hash_table_size);
 
+    if (run_type == "verbose") {
+        BUtil::print("Initializing hash table of size %zu for %zu kmers.\n", hash_table_size, n_kmers);
+    }
+
     std::vector<kmer_pair> kmers = read_kmers(kmer_fname, upcxx::rank_n(), upcxx::rank_me());
+    if (run_type == "verbose") {
+        BUtil::print("Finished reading kmers.\n");
+    }
 
-    upcxx::barrier();
-    auto start_insert = std::chrono::high_resolution_clock::now();
-
+    auto start = std::chrono::high_resolution_clock::now();
     std::vector<kmer_pair> start_nodes;
     for (auto &kmer : kmers) {
-        bool ok = hashmap.insert(kmer);
-        if (!ok) {
+        bool success = hashmap.insert(kmer);
+        if (!success) {
             throw std::runtime_error("Error: HashMap is full!");
         }
         if (kmer.backwardExt() == 'F') {
             start_nodes.push_back(kmer);
         }
     }
-
-    upcxx::barrier();
     auto end_insert = std::chrono::high_resolution_clock::now();
-    double insert_time = std::chrono::duration<double>(end_insert - start_insert).count();
-    if (run_type != "test" && upcxx::rank_me() == 0) {
+    upcxx::barrier();
+
+    double insert_time = std::chrono::duration<double>(end_insert - start).count();
+    if (run_type != "test")
         BUtil::print("Finished inserting in %lf seconds\n", insert_time);
-    }
-
-    upcxx::dist_object<std::vector<kmer_pair>> dstart(start_nodes);
     upcxx::barrier();
+
     auto start_read = std::chrono::high_resolution_clock::now();
-
-    std::vector<kmer_pair> merged_starts;
-    if (upcxx::rank_me() == 0) {
-        merged_starts = dstart.fetch(0).wait();
-        for (int r = 1; r < upcxx::rank_n(); r++) {
-            auto remote_vec = dstart.fetch(r).wait();
-            merged_starts.insert(merged_starts.end(), remote_vec.begin(), remote_vec.end());
-        }
-    }
-
     std::list<std::list<kmer_pair>> contigs;
-    if (upcxx::rank_me() == 0) {
-        for (auto &start_k : merged_starts) {
-            std::list<kmer_pair> contig;
-            contig.push_back(start_k);
-            while (contig.back().forwardExt() != 'F') {
-                kmer_pair next_k;
-                bool found = hashmap.find(contig.back().next_kmer(), next_k);
-                if (!found) {
-                    throw std::runtime_error("Error: k-mer not found in hashmap.");
-                }
-                contig.push_back(next_k);
+    for (const auto &start_kmer : start_nodes) {
+        std::list<kmer_pair> contig;
+        contig.push_back(start_kmer);
+        while (contig.back().forwardExt() != 'F') {
+            kmer_pair kmer;
+            bool found = hashmap.find(contig.back().next_kmer(), kmer);
+            if (!found) {
+                throw std::runtime_error("Error: k-mer not found in hashmap.");
             }
-            contigs.push_back(contig);
+            contig.push_back(kmer);
         }
+        contigs.push_back(contig);
+    }
+    auto end_read = std::chrono::high_resolution_clock::now();
+    upcxx::barrier();
+    auto total = std::chrono::high_resolution_clock::now() - start;
+    double read_time = std::chrono::duration<double>(end_read - start_read).count();
+
+    int numKmers = std::accumulate(
+        contigs.begin(), contigs.end(), 0,
+        [](int sum, const std::list<kmer_pair> &contig) { return sum + contig.size(); });
+
+    if (run_type != "test") {
+        BUtil::print("Assembled in %lf seconds total.\n",
+                     std::chrono::duration<double>(total).count());
     }
 
-    upcxx::barrier();
-    auto end_read = std::chrono::high_resolution_clock::now();
-    auto total_end = std::chrono::high_resolution_clock::now();
+    if (run_type == "verbose") {
+        printf("Rank %d reconstructed %zu contigs with %d nodes from %zu start nodes. (read: %lf, insert: %lf, total: %lf)\n",
+               upcxx::rank_me(), contigs.size(), numKmers, start_nodes.size(),
+               read_time, std::chrono::duration<double>(end_insert - start).count(),
+               std::chrono::duration<double>(total).count());
+    }
 
-    std::chrono::duration<double> read_time = end_read - start_read;
-    std::chrono::duration<double> total_time = total_end - start_insert;
-
-    if (upcxx::rank_me() == 0) {
-        int numKmers = 0;
-        for (auto &c : contigs) {
-            numKmers += (int)c.size();
+    if (run_type == "test") {
+        std::ofstream fout(test_prefix + "_" + std::to_string(upcxx::rank_me()) + ".dat");
+        for (const auto &contig : contigs) {
+            fout << extract_contig(contig) << std::endl;
         }
-        if (run_type != "test") {
-            BUtil::print("Assembled in %lf seconds total\n", total_time.count());
-        }
-        if (run_type == "verbose") {
-            printf("Rank %d reconstructed %lu contigs with %d nodes. (read %lf, insert %lf, total %lf)\n",
-                   upcxx::rank_me(), contigs.size(), numKmers, read_time.count(), insert_time, total_time.count());
-        }
-        if (run_type == "test") {
-            std::ofstream fout(test_prefix + "_" + std::to_string(upcxx::rank_me()) + ".dat");
-            for (auto &c : contigs) {
-                fout << extract_contig(c) << "\n";
-            }
-            fout.close();
-        }
+        fout.close();
     }
 
     upcxx::finalize();
