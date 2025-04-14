@@ -11,13 +11,27 @@
 #include <upcxx/upcxx.hpp>
 #include "hash_map.hpp"
 #include "kmer_t.hpp"
-#include "read_kmers.hpp"  
+#include "read_kmers.hpp"
 #include "butil.hpp"
 
-#define MAX_CHAIN_LENGTH 1000  // Maximum allowed chain length
+//---------------------------------------------------------------------
+// Helper Function: contig_ended
+//   - For a start node (backwardExt() == 'F'): the contig ends only if the forward
+//     extension (the second character) equals 'F'.
+//   - For a non-start node: we use the forward extension (as given by forwardExt())
+//     to determine the termination. (You could also check both characters if desired.)
+bool contig_ended(const kmer_pair &kp) {
+    // Get the full two-character extension string.
+    std::string ext = kp.fb_ext_str();  // from kmer_t.hpp
 
-// Uncomment the following macro if you want extra verbose logging in assembly phase.
-// #define VERBOSE_ASSEMBLY 1
+    // If this is a start node, check only the forward extension (second character).
+    if (kp.backwardExt() == 'F') {
+        return (ext.size() >= 2 && ext[1] == 'F');
+    } else {
+        // For non-start nodes, we check if the forward extension equals 'F'.
+        return (kp.forwardExt() == 'F');
+    }
+}
 
 int main(int argc, char **argv) {
     upcxx::init();
@@ -55,7 +69,7 @@ int main(int argc, char **argv) {
     // Create the distributed hash table.
     HashMap hashmap(hash_table_size);
 
-    // Read kmers from the file. Each rank reads its partition.
+    // Each rank reads its partition of kmers.
     std::vector<kmer_pair> kmers = read_kmers(kmer_fname, upcxx::rank_n(), upcxx::rank_me());
     upcxx::barrier();
 
@@ -75,14 +89,14 @@ int main(int argc, char **argv) {
     }
 
     // Identify starting kmers for contig assembly.
+    // By our convention, a contig starts when its backward extension equals 'F'.
     std::vector<kmer_pair> start_nodes;
     for (const auto &kp : kmers) {
-        if (kp.backwardExt() == 'F') { // This condition identifies a contig start.
+        if (kp.backwardExt() == 'F') {
             start_nodes.push_back(kp);
         }
     }
 
-    // Barrier and time the contig assembly phase.
     upcxx::barrier();
     auto start_assemble = std::chrono::high_resolution_clock::now();
 
@@ -93,15 +107,11 @@ int main(int argc, char **argv) {
         std::list<kmer_pair> contig;
         contig.push_back(start_kmer);
 
-        while (contig.back().forwardExt() != 'F') {
-            if (contig.size() >= MAX_CHAIN_LENGTH) {
-                BUtil::print("WARNING: Maximum chain length (%d) exceeded for contig starting with %s. Breaking out.\n",
-                             MAX_CHAIN_LENGTH, contig.front().kmer.get().c_str());
-                break;
-            }
-
-            // Check for cycles in the contig.
+        // Keep adding nodes until the termination condition is met.
+        while (!contig_ended(contig.back())) {
             pkmer_t next = contig.back().next_kmer();
+
+            // Cycle detection: if the next kmer already exists in the current contig, break.
             bool cycle_found = false;
             for (const auto &existing : contig) {
                 if (existing.kmer.get() == next.get()) {
@@ -129,7 +139,8 @@ int main(int argc, char **argv) {
     double assemble_time = std::chrono::duration<double>(end_assemble - start_assemble).count();
     double total_time = std::chrono::duration<double>(end_assemble - start_insert).count();
 
-    int numKmers = std::accumulate(contigs.begin(), contigs.end(), 0,
+    int numKmers = std::accumulate(
+        contigs.begin(), contigs.end(), 0,
         [](int sum, const std::list<kmer_pair>& contig) { return sum + contig.size(); });
 
     if (run_type != "test") {
